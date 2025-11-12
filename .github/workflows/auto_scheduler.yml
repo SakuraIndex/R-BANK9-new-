@@ -8,7 +8,7 @@ on:
         required: false
         default: "false"
   schedule:
-    - cron: "*/5 * * * 1-5"   # 平日5分
+    - cron: "*/5 * * * 1-5"   # UTC基準。JST内かどうかは下の判定で制御
 
 permissions:
   contents: write
@@ -19,13 +19,20 @@ jobs:
     timeout-minutes: 10
     env:
       FORCE: ${{ github.event.inputs.force == 'true' && '1' || '0' }}
+      # サイト公開は Secrets が設定されている時だけ有効化
+      SITE_REPO:  ${{ secrets.SITE_REPO }}
+      SITE_TOKEN: ${{ secrets.SITE_TOKEN }}
+
     steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
       - name: Install deps
         run: |
@@ -34,52 +41,81 @@ jobs:
 
       - name: Compute JST session flags
         id: flags
-        shell: python
+        shell: bash
         run: |
-          from datetime import datetime, time, timedelta
+          python - <<'PY'
+          import os
+          from datetime import datetime, time
           from zoneinfo import ZoneInfo
+
           tz = ZoneInfo("Asia/Tokyo")
           now = datetime.now(tz)
-          s, e = time(9,0), time(15,30)
-          start = datetime.combine(now.date(), s, tzinfo=tz)
-          end   = datetime.combine(now.date(), e, tzinfo=tz)
+          start = datetime.combine(now.date(), time(9,0),  tzinfo=tz)
+          end   = datetime.combine(now.date(), time(15,30), tzinfo=tz)
           in_session = start <= now <= end
-          print(f"in_session={'true' if in_session else 'false'}")
 
-      - name: Build intraday (always on session OR forced)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as g:
+              g.write(f"in_session={'true' if in_session else 'false'}\n")
+          print(f"[INFO] JST now={now}, in_session={in_session}")
+          PY
+
+      - name: Build intraday (only during session OR forced)
         if: steps.flags.outputs.in_session == 'true' || env.FORCE == '1'
         run: |
+          echo "[INFO] Running intraday builder..."
+          # スクリプト内で docs/outputs へ書き出す実装になっている前提
           python src/rbank9_intraday.py
 
       - name: Commit outputs (this repo)
         if: steps.flags.outputs.in_session == 'true' || env.FORCE == '1'
         run: |
+          echo "[INFO] Committing local outputs..."
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p docs/outputs
           git add docs/outputs/* || true
           git commit -m "chore(intraday): rbank9" || echo "no changes"
           git push || true
 
+      # ---- サイト側への反映（Secrets が揃っている時だけ実行） ----
+      - name: Check site secrets presence
+        id: site_ok
+        run: |
+          if [ -n "${SITE_REPO}" ] && [ -n "${SITE_TOKEN}" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "[INFO] SITE secrets detected. Site publish will run."
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "[INFO] SITE secrets NOT found. Site publish will be skipped."
+          fi
+
       - name: Checkout SITE repo
-        if: steps.flags.outputs.in_session == 'true' || env.FORCE == '1'
+        if: (steps.flags.outputs.in_session == 'true' || env.FORCE == '1') && steps.site_ok.outputs.ok == 'true'
         uses: actions/checkout@v4
         with:
-          repository: ${{ secrets.SITE_REPO }}
+          repository: ${{ env.SITE_REPO }}
           path: site
-          token: ${{ secrets.SITE_TOKEN }}
+          token: ${{ env.SITE_TOKEN }}
+          fetch-depth: 0
 
       - name: Render (legacy design) into SITE repo
-        if: steps.flags.outputs.in_session == 'true' || env.FORCE == '1'
+        if: (steps.flags.outputs.in_session == 'true' || env.FORCE == '1') && steps.site_ok.outputs.ok == 'true'
         run: |
+          echo "[INFO] Rendering legacy-design charts into SITE repo..."
           python scripts/site_render_intraday.py
           python scripts/publish_to_site.py
 
       - name: Commit to SITE repo
-        if: steps.flags.outputs.in_session == 'true' || env.FORCE == '1'
+        if: (steps.flags.outputs.in_session == 'true' || env.FORCE == '1') && steps.site_ok.outputs.ok == 'true'
         working-directory: site
         run: |
+          echo "[INFO] Committing to SITE repo..."
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/charts/R_BANK9/*
+          git add docs/charts/R_BANK9/* || true
           git commit -m "Update R-BANK9 intraday charts (JST)" || echo "no site changes"
           git push || true
+
+      - name: Skip note (no site secrets)
+        if: (steps.flags.outputs.in_session == 'true' || env.FORCE == '1') && steps.site_ok.outputs.ok != 'true'
+        run: echo "[INFO] Site secrets are not set. Skipped site publish."
